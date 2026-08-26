@@ -3,7 +3,7 @@ title: pure-flashblade-storage-provider
 authors:
   - Danni Shi
 creation-date: 2026-07-27
-last-updated: 2026-08-14
+last-updated: 2026-08-26
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-2117
 prd:
@@ -138,15 +138,21 @@ sequenceDiagram
 
 The diagram shows the `setup` action flow. The role reads the admin-configured Realm assignment from the `PURE_REALM_POOL` ConfigMap and the corresponding credential Secret, provisions FlashBlade resources within the Realm, and persists the tenant configuration to a hub Secret.
 
-1. The `setup` action reads `PURE_REALM_POOL` from the Instance Group ConfigMap (JSON array of `{"realm_name": "...", "secret_name": "..."}` objects).
+1. The `setup` action first checks whether a hub Secret (`pure-tenant-config-<tenant-name>`) already exists for this tenant. If it does, the action reads the existing Secret, extracts the Realm assignment, and skips Realm selection and FlashBlade provisioning (idempotent retry). This ensures retries after partial failures reuse the same Realm assignment rather than binding the tenant to a different Realm.
 
-2. It selects the first available Realm entry from the pool. If the pool is empty or not configured, the task fails with: `"No Realm configured in PURE_REALM_POOL. Configure Realm pool entries in the Instance Group ConfigMap."`
+2. If no hub Secret exists, the action reads `PURE_REALM_POOL` from the Instance Group ConfigMap (JSON array of `{"realm_name": "...", "secret_name": "..."}` objects).
 
-3. It reads the corresponding K8s Secret to obtain the Realm-scoped API token, management endpoint, and NFS endpoint.
+3. It selects the first available Realm entry from the pool. If the pool is empty or not configured, the task fails with: `"No Realm configured in PURE_REALM_POOL. Configure Realm pool entries in the Instance Group ConfigMap."` The admin is responsible for ensuring each Realm is assigned to only one tenant — the static pool configuration model relies on the admin not listing the same Realm in multiple tenant configurations.
 
-4. It provisions FlashBlade resources within the Realm (NFS filesystems and export policies) using the Realm-scoped API token from the credential Secret.
+4. It reads the corresponding K8s Secret to obtain the Realm-scoped API token, management endpoint, and NFS endpoint.
 
-5. It persists the tenant configuration to a hub Secret labeled `osac.openshift.io/tenant: <tenant-name>`:
+5. It provisions FlashBlade resources within the Realm using the Realm-scoped API token from the credential Secret:
+   - Creates an NFS server within the Realm (`purefb_server` module) with a tenant-scoped name (e.g., `osac-<tenant-name>`).
+   - Creates an NFS export policy (`purefb_policy` module) scoped to the NFS server, restricting client access to the tenant's workload cluster pod CIDRs.
+   - Creates NFS filesystems (`purefb_fs` module) within the Realm, attached to the NFS server.
+   - The NFS server name and export policy name are persisted to the hub Secret for use by `ensure_storage_class` and `teardown_backend`.
+
+6. It persists the tenant configuration to a hub Secret labeled `osac.openshift.io/tenant: <tenant-name>`:
 
    ```yaml
    apiVersion: v1
@@ -169,7 +175,7 @@ The diagram shows the `setup` action flow. The role reads the admin-configured R
 6. The operator detects the hub Secret and sets `StorageBackendReady=True`.
 
 7. The operator triggers `osac-create-tenant-cluster-storage` (Stage 2). The `ensure_storage_class` action:
-   - Appends the tenant's Realm-scoped credentials to the shared Pure controller credential Secret (`pure-csi-credentials`) on the hub cluster in the `osac-csi-backends` namespace, using optimistic-locking read-modify-write for concurrent safety.
+   - Upserts the tenant's Realm-scoped credentials into the shared Pure controller credential Secret (`pure-csi-credentials`) on the hub cluster in the `osac-csi-backends` namespace. The upsert is keyed by Realm name: if an entry with the same `Realm` value already exists in the `FlashBlades` array (from a previous run or retry), it is replaced in place; otherwise, a new entry is appended. This prevents duplicate entries on retry after a partial failure where the Secret update succeeded but subsequent StorageClass creation failed. The operation uses optimistic-locking read-modify-write for concurrent safety.
    - Creates per-tier NFS StorageClasses on the tenant cluster with `provisioner: osac.csi.openshift.io`, OSAC labels, and PX-CSI backend parameters.
    - Does not create VolumeSnapshotClasses (snapshot restore is unsupported with Realm-scoped credentials in PX-CSI 26.2.0).
 
@@ -179,7 +185,9 @@ The diagram shows the `setup` action flow. The role reads the admin-configured R
 
 Starting state: A Tenant CR is being deleted.
 
-1. The operator triggers `osac-delete-tenant-cluster-storage`. The `teardown_cluster_storage` action removes StorageClasses from the target tenant cluster.
+1. The operator triggers `osac-delete-tenant-cluster-storage`. The `teardown_cluster_storage` action:
+   - Checks for any PVCs or PVs referencing the tenant's Pure-backed StorageClasses. If active volumes exist, the action fails with a descriptive error: `"Active PVCs found referencing Pure StorageClasses. Delete tenant workloads and PVCs before offboarding."` This prevents data loss from premature Realm resource deletion.
+   - Once no active volumes remain, removes StorageClasses from the target tenant cluster.
 
 2. The operator triggers `osac-delete-tenant-storage-backend`. The `teardown_backend` action:
    - Reads the hub Secret to identify the Realm.
@@ -199,15 +207,15 @@ Starting state: Tenant onboarding is complete. StorageClasses are visible on the
 
 #### Error Handling
 
-**Realm configuration missing:** The `setup` action fails if `PURE_REALM_POOL` is not configured or the referenced credential Secret does not exist. The AAP job reports failure. The operator sets `StorageBackendReady=False`. The Cloud Infrastructure Admin must configure the Realm pool in the Instance Group ConfigMap and create the credential Secrets.
+**Realm configuration missing:** The `setup` action fails if `PURE_REALM_POOL` is not configured or the referenced credential Secret does not exist. The AAP job reports failure. The operator sets `StorageBackendReady=False`. The Cloud Infrastructure Admin must configure the Realm pool in the Instance Group ConfigMap and create the credential Secrets. The operator's reconciliation loop automatically re-evaluates on the next trigger (Tenant CR change, periodic resync, or manual annotation touch), so no manual retry is needed once the admin fixes the configuration.
 
-**FlashBlade API unreachable:** The `setup` action's `purefb_fs` or `purefb_policy` calls fail with a connection error. The block/rescue pattern rolls back any partially-created FlashBlade resources. The AAP job reports failure with the connection error.
+**FlashBlade API unreachable:** The `setup` action's `purefb_fs`, `purefb_server`, or `purefb_policy` calls fail with a connection error. The block/rescue pattern rolls back any partially-created FlashBlade resources (but does not delete the hub Secret if it was created in a previous successful run — idempotent retry will reuse the existing Realm assignment). The AAP job reports failure with the connection error. The operator re-triggers the job on the next reconciliation with exponential backoff.
 
 **Network connectivity:** If the workload cluster cannot reach the FlashBlade NFS data VIP, PVC provisioning fails at the CSI level. This manifests as PVCs stuck in Pending state. The Tenant Admin sees the PVC event. Network connectivity is an infrastructure prerequisite documented in the PRD Assumptions section.
 
 ### API Extensions
 
-**fulfillment-service:** No code changes. Existing `StorageBackend` and `StorageTier` APIs are used for backend registration (data-only). Realm pool management is handled through static configuration (K8s Secrets + ConfigMap) in the initial implementation. A future generic storage pool management enhancement may introduce fulfillment-service API support for dynamic pool tracking.
+**fulfillment-service:** No code changes. Existing `StorageBackend` and `StorageTier` APIs are used for backend registration (data-only). The OSAC-1111 `StorageBackend` design specifies `credentials.username` and `credentials.password` fields. Pure FlashBlade uses per-Realm API tokens instead of username/password credentials — a provider-specific exception. The `StorageBackend` registration for Pure backends supplies only the `provider` and management endpoint fields; Realm credentials are stored as K8s Secrets on the hub cluster and are never placed in the fulfillment-service database. The `credentials` fields on the `StorageBackend` record are left empty for `provider: "pure"` backends. This is consistent with the OSAC-1111 design's intent (backend-level authentication) but uses a different credential type. If the `StorageBackend` API adds credential-type validation in the future, Pure must be registered as an external-credential provider. Realm pool management is handled through static configuration (K8s Secrets + ConfigMap) in the initial implementation. A future generic storage pool management enhancement may introduce fulfillment-service API support for dynamic pool tracking.
 
 **osac-operator:** The `StorageReconciler` requires no changes — it discovers Pure-backed StorageClasses via the same label-based mechanism it uses for VAST. However, the Volume controller (OSAC-2872/OSAC-4138) requires a `PureVendorProvisioner` to handle Pure volume provisioning. OSAC-4221 introduces provider-keyed routing with a `map[provider]VendorProvisioner` dispatcher and ships Pure as a stub returning `Unimplemented`. This design fills that stub with a concrete `PureVendorProvisioner` that maps Pure-specific hub Secret keys, CSI parameters (NFS endpoint, Realm, NFS server, NFS policy), and the `pure_file` backend type into `VendorCreateVolumeRequest`/`VendorDeleteVolumeRequest`.
 
@@ -356,7 +364,7 @@ The `ensure_storage_class` action reads this Secret and adds the tenant's Realm 
 }
 ```
 
-Each tenant's Realm entry is appended to the `FlashBlades` array. The `teardown_backend` action removes only the tenant's entry from the array without affecting other tenants' credentials.
+Each tenant's Realm entry is upserted into the `FlashBlades` array, keyed by `Realm` name. The `teardown_backend` action removes only the tenant's entry (matched by `Realm`) from the array without affecting other tenants' credentials.
 
 #### osac-csi-driver Integration
 
@@ -367,7 +375,7 @@ The osac-csi-driver provides vendor-agnostic CSI provisioning for OSAC. Per the 
 
 The AAP `ensure_storage_class` action:
 
-1. Updates the shared Pure controller credential Secret (`pure-csi-credentials`) in the `osac-csi-backends` namespace on the hub cluster using an optimistic-locking read-modify-write: reads the Secret (capturing `resourceVersion`), appends the tenant's Realm entry to the `FlashBlades` array, and writes it back with the captured `resourceVersion`. If the write conflicts (another onboarding or offboarding updated the Secret concurrently), the task retries from the read step (up to 3 retries). If the Secret does not exist, it creates it with the tenant's entry.
+1. Upserts the tenant's Realm entry into the shared Pure controller credential Secret (`pure-csi-credentials`) in the `osac-csi-backends` namespace on the hub cluster using an optimistic-locking read-modify-write: reads the Secret (capturing `resourceVersion`), upserts the tenant's Realm entry in the `FlashBlades` array (keyed by `Realm` — replaces if exists, appends if new), and writes it back with the captured `resourceVersion`. If the write conflicts (another onboarding or offboarding updated the Secret concurrently), the task retries from the read step (up to 3 retries). If the Secret does not exist, it creates it with the tenant's entry.
 2. Creates StorageClasses on the tenant cluster with `provisioner: osac.csi.openshift.io` and backend-specific parameters including the `pure_realm` Realm selector.
 
 The OSAC CSI driver installation on hub and tenant clusters is handled by osac-installer, not by the Pure AAP role. The AAP role manages per-tenant entries in the shared credential Secret and per-tenant StorageClasses.
@@ -402,7 +410,7 @@ reclaimPolicy: Delete
 volumeBindingMode: Immediate
 ```
 
-The `pure_realm` parameter is the Realm selector — PX-CSI uses it to match the provisioning request to the correct `FlashBlades` entry in `pure.json` by Realm name. The naming convention (`pure-nfs-<tenant>-<tier>`) and label set are consistent with the VAST role's pattern (`vast-nfs-<tenant>-<tier>`).
+The `pure_realm` parameter is the Realm selector — PX-CSI uses it to match the provisioning request to the correct `FlashBlades` entry in `pure.json` by Realm name. The `pure_nfs_server` and `pure_nfs_policy` parameters reference the NFS server and export policy created during `setup` within the Realm. **Verification required:** The PX-CSI 26.2.0 StorageClass reference documents `Realm` in `pure.json` `FlashBlades` entries but does not explicitly document `pure_realm` as a StorageClass parameter. The OSAC CSI proxy must translate `pure_realm` to the PX-CSI backend identity mechanism, or the parameter must be replaced with the documented routing mechanism. This must be validated with a two-Realm test to confirm requests route to the correct credential set (see OQ-1 and OQ-3). The naming convention (`pure-nfs-<tenant>-<tier>`) and label set are consistent with the VAST role's pattern (`vast-nfs-<tenant>-<tier>`).
 
 #### VolumeSnapshotClass Creation
 
@@ -492,26 +500,34 @@ All Ansible tasks that handle API tokens, credential Secrets, or `pure.json` con
 
 ### Failure Handling and Recovery
 
-**Realm configuration missing.** The `setup` task reads `PURE_REALM_POOL` from the IG ConfigMap. If the pool is empty or not configured, it fails with a descriptive error. No hub Secret is created. The AAP job fails. The operator sets `StorageBackendReady=False`. Recovery: admin configures Realm pool entries in the IG ConfigMap and creates credential Secrets.
+**Realm configuration missing.** The `setup` task reads `PURE_REALM_POOL` from the IG ConfigMap. If the pool is empty or not configured, it fails with a descriptive error. No hub Secret is created. The AAP job fails. The operator sets `StorageBackendReady=False`. Recovery: admin configures Realm pool entries in the IG ConfigMap and creates credential Secrets. The operator's reconciliation loop automatically retries on the next trigger (Tenant CR change, periodic resync, or manual annotation touch) with exponential backoff.
 
-**FlashBlade API failure during setup.** The `setup` task uses a `block/rescue` pattern. On failure: the rescue block removes any partially-created NFS filesystems and export policies, and deletes the hub Secret if partially written. The AAP job reports the original error. The role is idempotent: re-running `setup` after a failure retries from scratch.
+**FlashBlade API failure during setup.** The `setup` task uses a `block/rescue` pattern. On failure: the rescue block removes any partially-created NFS filesystems, NFS servers, and export policies, but preserves the hub Secret if it was created in a prior successful run (so the Realm assignment is retained for retry). If the hub Secret was partially written in this run, the rescue block deletes it. The AAP job reports the original error. The role is idempotent: re-running `setup` after a failure checks for the existing hub Secret (retaining the Realm assignment) and retries only the failed FlashBlade operations.
 
-**CSI credential Secret update failure.** The `ensure_storage_class` action appends the tenant's Realm entry to the shared Pure controller credential Secret on the hub cluster using optimistic-locking read-modify-write. If the write conflicts, the task retries (up to 3 times). If retries are exhausted or the Secret update fails for another reason, subsequent StorageClass creation is skipped. The operator sets `ClusterStorageReady=False`. Recovery: the Cloud Provider Admin investigates the hub cluster state and re-triggers the job.
+**CSI credential Secret update failure.** The `ensure_storage_class` action upserts the tenant's Realm entry into the shared Pure controller credential Secret on the hub cluster using optimistic-locking read-modify-write. If the write conflicts, the task retries (up to 3 times). If retries are exhausted or the Secret update fails for another reason, subsequent StorageClass creation is skipped. The operator sets `ClusterStorageReady=False`. Recovery: the Cloud Provider Admin investigates the hub cluster state; the operator automatically re-triggers the job on the next reconciliation with exponential backoff. Because the upsert is keyed by Realm name, retries do not create duplicate entries.
 
 **StorageClass creation failure.** The `ensure_storage_class` action uses `kubernetes.core.k8s` with `state: present` for idempotent creation. If a StorageClass cannot be created, the task fails. The `always` block clears credential facts. Re-running the action retries creation.
 
 **Controller restart mid-reconciliation.** The operator's `StorageReconciler` is stateless: it re-reads the Tenant CR, checks for the hub Secret, resolves StorageClasses by label, and triggers AAP jobs through the `RunProvisioningLifecycle` pattern. A restart causes a full re-evaluation with no data loss.
 
-**Teardown with missing hub Secret.** If the hub Secret has been deleted before `teardown_backend` runs, the role cannot authenticate to FlashBlade to clean up resources. The role logs a warning and skips FlashBlade cleanup. The admin must manually clean up FlashBlade resources within the Realm.
+**Teardown with missing hub Secret.** If the hub Secret has been deleted before `teardown_backend` runs, the role cannot authenticate to FlashBlade to clean up resources. The role logs a warning, skips FlashBlade cleanup, and still removes the tenant's entry from the shared `pure-csi-credentials` Secret (if present) to prevent stale credential entries. The admin must manually clean up FlashBlade resources (NFS filesystems, export policies, and the NFS server) within the Realm.
 
 ### RBAC / Tenancy
 
 No RBAC or tenancy changes are required. The Pure role creates resources with the same tenant isolation metadata as VAST:
 
-- `osac.openshift.io/tenant: <tenant-name>` label on StorageClasses, hub Secrets, and CSI credential Secrets.
+- `osac.openshift.io/tenant: <tenant-name>` label on StorageClasses and per-tenant hub Secrets (`pure-tenant-config-<tenant>`).
 - `app.kubernetes.io/managed-by: osac-aap` label on all managed resources.
 - The operator filters StorageClasses and hub Secrets by these labels.
 - OPA policies enforce tenant isolation at the fulfillment-service API level (unchanged).
+
+**Shared CSI credential Secret (`pure-csi-credentials`).** This Secret is platform-scoped, not tenant-scoped — it contains `FlashBlades` entries for all tenants. It carries the label `app.kubernetes.io/managed-by: osac-aap` but no `osac.openshift.io/tenant` label. RBAC for this Secret:
+
+- **Pure CSI controller:** Read access (mounts the Secret as a volume).
+- **AAP service account:** Read/write access (upserts entries during `ensure_storage_class`, removes entries during `teardown_backend`).
+- **Tenant identities:** No access. Tenant-scoped service accounts must not have `get`, `list`, or `watch` permissions on Secrets in the `osac-csi-backends` namespace.
+
+The `osac-csi-backends` namespace is an infrastructure namespace with no tenant-facing access. Existing RBAC already restricts tenant identities from accessing it.
 
 ### Observability and Monitoring
 
@@ -622,11 +638,21 @@ Pure Storage has confirmed that FlashBlade supports up to 200 Realms per array. 
 
 - `ansible-lint` validation of all Pure role task files, defaults, and metadata.
 - Molecule or integration test for the `pure_storage` role using mocked FlashBlade API responses (via `ansible.builtin.uri` mocking) and a kind cluster:
-  - `setup`: Realm credential Secret reading, FlashBlade resource creation, hub Secret creation, rollback on failure.
-  - `ensure_storage_class`: Shared credential Secret read-modify-write (append tenant entry, conflict retry), StorageClass creation with correct labels and Realm selector, idempotency (short-circuit when SCs exist).
-  - `teardown_cluster_storage`: StorageClass removal.
-  - `teardown_backend`: hub Secret deletion, tenant entry removal from shared credential Secret (delete Secret only when `FlashBlades` array is empty).
+  - `setup`: Realm credential Secret reading, NFS server creation, NFS export policy creation, FlashBlade filesystem creation, hub Secret creation with server/policy names, rollback on failure (cleanup of NFS server, policy, and filesystems).
+  - `setup` idempotency: Re-running `setup` when hub Secret exists reuses the existing Realm assignment and skips Realm selection.
+  - `ensure_storage_class`: Shared credential Secret upsert (keyed by Realm name — verify replace-in-place on retry, not duplicate append), conflict retry with optimistic locking, StorageClass creation with correct labels and Realm selector, idempotency (short-circuit when SCs exist).
+  - `ensure_storage_class` partial failure: Verify that if StorageClass creation fails after the credential Secret upsert succeeds, a retry does not create a duplicate `FlashBlades` entry.
+  - `teardown_cluster_storage`: PVC/PV existence check (fail if active volumes remain), StorageClass removal.
+  - `teardown_backend`: hub Secret deletion, tenant entry removal from shared credential Secret (delete Secret only when `FlashBlades` array is empty), NFS server and export policy cleanup.
   - Missing Realm configuration: empty PURE_REALM_POOL produces descriptive error message.
+  - Token redaction: verify all tasks handling `api_token`, credential Secrets, or `pure.json` content use `no_log: true` — validate that token values do not appear in captured task output.
+
+### Multi-Tenant Isolation Tests (osac-aap, kind-based)
+
+- Two-tenant shared CSI Secret: Onboard two tenants with different Realms; verify each has its own `FlashBlades` entry in `pure-csi-credentials` keyed by Realm name.
+- Stale teardown: Offboard tenant A, then verify tenant B's `FlashBlades` entry is unaffected and its StorageClasses remain functional.
+- Missing hub Secret: Trigger `teardown_backend` when the hub Secret has been externally deleted; verify the role logs a warning, skips FlashBlade cleanup, and removes the tenant's credential Secret entry.
+- Realm server and policy fields: Verify the hub Secret contains `nfs_server` and `nfs_policy` fields matching the NFS server and export policy created during `setup`.
 
 ### Unit Tests (osac-operator)
 
@@ -696,4 +722,4 @@ Final: revise @ design 0.9.0 - 5629175, workspace OSAC-2117 @ 1baec0f
 
 > Context changed between draft and revise.
 
-<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.9.0","ai_workflows":"5629175","source_repo":"1baec0f","source_repo_branch":"OSAC-2117","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.9.0","ai_workflows":"5629175","source_repo":"1baec0f","source_repo_branch":"OSAC-2117","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
