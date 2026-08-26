@@ -12,6 +12,7 @@ see-also:
   - "/enhancements/tenant-specific-storageclasses"
   - "/enhancements/OSAC-1110-storage-tier"
   - "/enhancements/OSAC-2872-storage-control-plane"
+  - "https://redhat.atlassian.net/browse/OSAC-4221"
 replaces:
   - N/A
 superseded-by:
@@ -22,13 +23,13 @@ superseded-by:
 
 ## Summary
 
-This enhancement adds Pure Storage FlashBlade as an NFS file storage provider in OSAC by implementing: (1) a new `pure_storage` Ansible template role that integrates with the existing provider-agnostic storage dispatch system, and (2) integration with the osac-csi-driver for CSI provisioning on workload clusters. The AAP role reads admin-configured Realm assignments, provisions FlashBlade resources within Realms using the `purestorage.flashblade` Ansible collection, and creates tenant-isolated StorageClasses with OSAC labels. The osac-csi-driver's existing Pure controller chart handles CSI operations — no vendor-specific components are installed directly on tenant clusters. Dynamic Realm pool management (checkout/release lifecycle, exhaustion handling, pool status tracking) is deferred to a future generic storage pool management enhancement. See [PRD](prd.md) for detailed requirements.
+This enhancement adds Pure Storage FlashBlade as an NFS file storage provider in OSAC by implementing: (1) a new `pure_storage` Ansible template role that integrates with the existing provider-agnostic storage dispatch system, (2) integration with the osac-csi-driver for CSI provisioning on workload clusters, and (3) a `PureVendorProvisioner` in the osac-operator that implements provider-keyed volume provisioning for Pure backends (depends on OSAC-4221). The AAP role reads admin-configured Realm assignments, provisions FlashBlade resources within Realms using the `purestorage.flashblade` Ansible collection, and creates tenant-isolated StorageClasses with OSAC labels. The osac-csi-driver's existing Pure controller chart handles CSI operations — no vendor-specific components are installed directly on tenant clusters. Dynamic Realm pool management (checkout/release lifecycle, exhaustion handling, pool status tracking) is deferred to a future generic storage pool management enhancement. See [PRD](prd.md) for detailed requirements.
 
 ## Motivation
 
 OSAC currently supports only VAST as a file storage backend. Datacenters running Pure Storage FlashBlade hardware cannot provision tenant-isolated NFS storage through OSAC, forcing manual configuration outside the platform. FlashBlade is a widely deployed enterprise file and object storage platform with built-in multi-tenancy through Secure Multi-Tenancy (SMT) Realms, making it a natural fit for OSAC's per-tenant isolation model.
 
-The existing storage provider dispatch system (`osac.service.storage_provider`) is already dynamic: adding a `provider: "pure"` entry to `STORAGE_TIERS` automatically dispatches to `osac.templates.pure_storage`. This design leverages that extensibility, requiring a new template role, a fulfillment-service API for Realm pool management, and verification of the osac-csi-driver's Pure backend compatibility. The osac-operator's StorageReconciler discovers StorageClasses by OSAC labels, not by provider type, so Pure-backed StorageClasses integrate into the existing tenant storage resolution without operator changes.
+The existing storage provider dispatch system (`osac.service.storage_provider`) is already dynamic: adding a `provider: "pure"` entry to `STORAGE_TIERS` automatically dispatches to `osac.templates.pure_storage`. This design leverages that extensibility, requiring a new template role, a fulfillment-service API for Realm pool management, and verification of the osac-csi-driver's Pure backend compatibility. The osac-operator's StorageReconciler discovers StorageClasses by OSAC labels, not by provider type, so Pure-backed StorageClasses integrate into the existing tenant storage resolution without StorageReconciler changes. However, the Volume controller's vendor provisioning path (OSAC-2872/OSAC-4138) currently routes all volumes through a single `VastVendorProvisioner` that hardcodes VAST-specific Secret names and CSI parameters. OSAC-4221 introduces provider-keyed routing with a Pure stub; this design fills that stub with a `PureVendorProvisioner` that handles NFS/file-specific provisioning parameters.
 
 The key design challenge is Realm-to-tenant assignment. Unlike VAST, where OSAC creates tenants on-demand via the VAST VMS API, FlashBlade Realms must be pre-created by array administrators and assigned to OSAC tenants during onboarding. For the initial implementation, Realm assignment is handled through static configuration: the Cloud Infrastructure Admin pre-creates Realm credential Secrets on the hub cluster and configures a Realm pool list in the Instance Group ConfigMap. The `setup` action reads the configured Realm assignment and provisions within it. Dynamic pool management with checkout/release semantics, exhaustion handling, and multi-backend pool status tracking is deferred to a future generic storage pool management enhancement applicable to all storage providers.
 
@@ -58,7 +59,7 @@ This enhancement introduces two components:
 
 2. **osac-csi-driver Pure backend verification.** The osac-csi-driver already includes a Pure controller chart (`charts/csi-backends/templates/pure-controller.yaml`) using the `px-pure-csi-driver` image. This design verifies FlashBlade NFS compatibility with the existing chart and documents any configuration changes needed for Realm support.
 
-The dispatcher routes to the AAP role automatically when `STORAGE_TIERS` contains entries with `"provider": "pure"`. No changes to the dispatcher, existing playbooks, or osac-operator are required.
+The dispatcher routes to the AAP role automatically when `STORAGE_TIERS` contains entries with `"provider": "pure"`. No changes to the AAP dispatcher or existing playbooks are required. On the operator side, the Volume controller requires a `PureVendorProvisioner` to route Pure volumes correctly (see Implementation Details).
 
 ### Workflow Description
 
@@ -194,7 +195,7 @@ Starting state: Tenant onboarding is complete. StorageClasses are visible on the
 
 1. The Tenant Admin or User discovers available StorageClasses through the OSAC console (which reads `Tenant.status.storageClasses` from the public API), or via `kubectl get storageclass -l osac.openshift.io/tenant=<tenant-name>`.
 
-2. The user creates PVCs referencing the Pure-backed StorageClass. The OSAC CSI driver on the tenant cluster proxies the provisioning request to the Pure controller on the hub, which provisions NFS volumes within the tenant's Realm on FlashBlade.
+2. The user creates PVCs referencing the Pure-backed StorageClass. The `CreateVolume` request reaches the Pure controller on the hub through the storage control plane (OSAC CSI driver → Volume CR → osac-operator Volume controller → Pure vendor CSI controller), which provisions NFS volumes within the tenant's Realm on FlashBlade.
 
 #### Error Handling
 
@@ -208,7 +209,7 @@ Starting state: Tenant onboarding is complete. StorageClasses are visible on the
 
 **fulfillment-service:** No code changes. Existing `StorageBackend` and `StorageTier` APIs are used for backend registration (data-only). Realm pool management is handled through static configuration (K8s Secrets + ConfigMap) in the initial implementation. A future generic storage pool management enhancement may introduce fulfillment-service API support for dynamic pool tracking.
 
-**osac-operator:** No code changes. The `StorageReconciler` discovers Pure-backed StorageClasses via the same label-based mechanism it uses for VAST.
+**osac-operator:** The `StorageReconciler` requires no changes — it discovers Pure-backed StorageClasses via the same label-based mechanism it uses for VAST. However, the Volume controller (OSAC-2872/OSAC-4138) requires a `PureVendorProvisioner` to handle Pure volume provisioning. OSAC-4221 introduces provider-keyed routing with a `map[provider]VendorProvisioner` dispatcher and ships Pure as a stub returning `Unimplemented`. This design fills that stub with a concrete `PureVendorProvisioner` that maps Pure-specific hub Secret keys, CSI parameters (NFS endpoint, Realm, NFS server, NFS policy), and the `pure_file` backend type into `VendorCreateVolumeRequest`/`VendorDeleteVolumeRequest`.
 
 **osac-aap:** The dispatcher includes the new role via the existing dynamic dispatch pattern (`include_role: name: "osac.templates.{{ _current_provider }}_storage"`). No changes to the dispatcher or playbooks.
 
@@ -436,6 +437,31 @@ No `PURE_ARRAY_ADMIN_TOKEN` or `PURE_MGMT_ENDPOINT` Secret entries are needed �
 
 The `purestorage.flashblade` collection (v1.26.0+) must be added to `osac-aap/collections/requirements.yml` and vendored into the `vendor/` directory. Its Python dependency `py-pure-client` must be added to the execution environment's Python requirements.
 
+#### PureVendorProvisioner (osac-operator)
+
+The Volume controller (OSAC-2872/OSAC-4138) provisions volumes by dispatching to a `VendorProvisioner` implementation. Today, a single `VastVendorProvisioner` hardcodes VAST-specific Secret lookups (`vast-tenant-config-<tenant>`) and CSI parameters (subsystem naming, VIP pool). A Pure backend currently mis-routes into VAST logic or fails at `endpointFor`.
+
+OSAC-4221 refactors this into a provider-driven registry: a `map[provider]VendorProvisioner` that routes each Volume to the correct vendor implementation by the `StorageBackend.spec.provider` value (plumbed from fulfillment-service through the Volume CR status). OSAC-4221 ships Pure as a stub returning `Unimplemented`.
+
+This design fills the stub with a `PureVendorProvisioner` that:
+
+1. **Hub Secret resolution.** Reads the Pure tenant config Secret (`pure-tenant-config-<tenant>`) by name and extracts `api_token`, `mgmt_endpoint`, `nfs_endpoint`, `realm_name`, `nfs_server`, and `nfs_policy`. This differs from the VAST provisioner, which reads `vast-tenant-config-<tenant>` with VAST-specific keys.
+
+2. **CSI parameter mapping.** Constructs `VendorCreateVolumeRequest` with Pure-specific parameters:
+   - `backend: "pure_file"` (vs. VAST's block backend type)
+   - `pure_realm: "<realm_name>"`
+   - `pure_nfs_server: "<nfs_server>"`
+   - `pure_nfs_policy: "<nfs_policy>"`
+   - `pure_nfs_endpoint: "<nfs_endpoint>"`
+
+3. **Vendor controller endpoint.** Resolves the Pure vendor CSI controller endpoint from `OSAC_VENDOR_CONTROLLERS` configuration (the same mechanism used for VAST, keyed by provider name).
+
+4. **NFS protocol handling.** Sets access mode to `ReadWriteMany` (NFS default, vs. block's `ReadWriteOnce`), and includes NFS mount options (`nfsvers=4.1`, `tcp`).
+
+5. **Delete volume.** Constructs `VendorDeleteVolumeRequest` with the same Pure-specific parameters. The Pure controller handles filesystem cleanup within the Realm.
+
+The provisioner is registered in `main.go` alongside the VAST provisioner when the operator starts, regardless of whether a Pure backend is configured — the stub is always present, matching OSAC-4221's pattern.
+
 ### Security Considerations
 
 **Credential scope.** OSAC operates with a single credential scope: the Realm-scoped API token (`storage_admin` role), which limits blast radius to a single tenant's Realm. The same token is copied to multiple storage locations during the provisioning lifecycle:
@@ -602,6 +628,14 @@ Pure Storage has confirmed that FlashBlade supports up to 200 Realms per array. 
   - `teardown_backend`: hub Secret deletion, tenant entry removal from shared credential Secret (delete Secret only when `FlashBlades` array is empty).
   - Missing Realm configuration: empty PURE_REALM_POOL produces descriptive error message.
 
+### Unit Tests (osac-operator)
+
+- `PureVendorProvisioner` hub Secret resolution: correct Secret name construction, key extraction, error on missing Secret.
+- CSI parameter mapping: correct `backend`, `pure_realm`, `pure_nfs_server`, `pure_nfs_policy`, `pure_nfs_endpoint` values in `VendorCreateVolumeRequest`.
+- NFS access mode: `ReadWriteMany` default for Pure file backend.
+- Provider routing: Volume with `provider: "pure"` dispatches to `PureVendorProvisioner`, not `VastVendorProvisioner`.
+- Delete volume: correct parameter mapping in `VendorDeleteVolumeRequest`.
+
 ### Integration Tests (osac-aap, kind-based)
 
 - Storage provider dispatch test: verify `provider: "pure"` in `STORAGE_TIERS` correctly dispatches to `osac.templates.pure_storage`.
@@ -652,3 +686,14 @@ The PX-CSI driver version on the hub cluster is managed by the osac-csi-driver c
 - **FlashBlade test environment:** For integration testing with real hardware. Can be deferred to Tech Preview; Dev Preview uses mocked API responses.
 - **osac-csi-driver with Pure backend enabled:** The existing Pure controller chart must be verified for FlashBlade NFS compatibility and configured for Realm support.
 - **Minimum FlashBlade version:** Purity//FB 4.6.1+ required for Realm support with PX-CSI.
+
+---
+
+## Provenance
+
+Authored: draft @ design 0.3.0 - 92734a2, workspace OSAC-2117 @ 1baec0f
+Final: revise @ design 0.9.0 - 5629175, workspace OSAC-2117 @ 1baec0f
+
+> Context changed between draft and revise.
+
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.9.0","ai_workflows":"5629175","source_repo":"1baec0f","source_repo_branch":"OSAC-2117","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
