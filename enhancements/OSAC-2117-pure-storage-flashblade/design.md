@@ -142,17 +142,19 @@ The diagram shows the `setup` action flow. The role reads the admin-configured R
 
 2. If no hub Secret exists, the action reads `PURE_REALM_POOL` from the Instance Group ConfigMap (JSON array of `{"realm_name": "...", "secret_name": "..."}` objects).
 
-3. It selects the first available Realm entry from the pool. If the pool is empty or not configured, the task fails with: `"No Realm configured in PURE_REALM_POOL. Configure Realm pool entries in the Instance Group ConfigMap."` The admin is responsible for ensuring each Realm is assigned to only one tenant — the static pool configuration model relies on the admin not listing the same Realm in multiple tenant configurations.
+3. It selects the first available Realm entry from the pool. If the pool is empty or not configured, the task fails with: `"No Realm configured in PURE_REALM_POOL. Configure Realm pool entries in the Instance Group ConfigMap."`
 
-4. It reads the corresponding K8s Secret to obtain the Realm-scoped API token, management endpoint, and NFS endpoint.
+4. **Realm double-assignment guard.** Before proceeding, the action queries for any existing hub Secrets in the `osac-system` namespace with the label `osac.openshift.io/pure-realm: <selected-realm-name>` that belong to a *different* tenant. If a matching Secret is found, the action fails with: `"Realm '<realm-name>' is already assigned to tenant '<other-tenant>'. Each Realm must be assigned to exactly one tenant."` This prevents admin misconfiguration from silently breaking tenant isolation by assigning the same Realm to multiple tenants.
 
-5. It provisions FlashBlade resources within the Realm using the Realm-scoped API token from the credential Secret:
+5. It reads the corresponding K8s Secret to obtain the Realm-scoped API token, management endpoint, and NFS endpoint.
+
+6. It provisions FlashBlade resources within the Realm using the Realm-scoped API token from the credential Secret:
    - Creates an NFS server within the Realm (`purefb_server` module) with a tenant-scoped name (e.g., `osac-<tenant-name>`).
    - Creates an NFS export policy (`purefb_policy` module) scoped to the NFS server, restricting client access to the tenant's workload cluster pod CIDRs.
    - Creates NFS filesystems (`purefb_fs` module) within the Realm, attached to the NFS server.
    - The NFS server name and export policy name are persisted to the hub Secret for use by `ensure_storage_class` and `teardown_backend`.
 
-6. It persists the tenant configuration to a hub Secret labeled `osac.openshift.io/tenant: <tenant-name>`:
+7. It persists the tenant configuration to a hub Secret labeled `osac.openshift.io/tenant: <tenant-name>` and `osac.openshift.io/pure-realm: <realm-name>` (the Realm label enables the double-assignment guard in step 4):
 
    ```yaml
    apiVersion: v1
@@ -163,6 +165,7 @@ The diagram shows the `setup` action flow. The role reads the admin-configured R
      labels:
        app.kubernetes.io/managed-by: osac-aap
        osac.openshift.io/tenant: "<tenant-name>"
+       osac.openshift.io/pure-realm: "<realm-name>"
    type: Opaque
    stringData:
      storage_provider_type: "pure"
@@ -172,14 +175,14 @@ The diagram shows the `setup` action flow. The role reads the admin-configured R
      nfs_endpoint: "<fb-nfs-data-vip>"
    ```
 
-6. The operator detects the hub Secret and sets `StorageBackendReady=True`.
+8. The operator detects the hub Secret and sets `StorageBackendReady=True`.
 
-7. The operator triggers `osac-create-tenant-cluster-storage` (Stage 2). The `ensure_storage_class` action:
+9. The operator triggers `osac-create-tenant-cluster-storage` (Stage 2). The `ensure_storage_class` action:
    - Upserts the tenant's Realm-scoped credentials into the shared Pure controller credential Secret (`pure-csi-credentials`) on the hub cluster in the `osac-csi-backends` namespace. The upsert is keyed by Realm name: if an entry with the same `Realm` value already exists in the `FlashBlades` array (from a previous run or retry), it is replaced in place; otherwise, a new entry is appended. This prevents duplicate entries on retry after a partial failure where the Secret update succeeded but subsequent StorageClass creation failed. The operation uses optimistic-locking read-modify-write for concurrent safety.
    - Creates per-tier NFS StorageClasses on the tenant cluster with `provisioner: osac.csi.openshift.io`, OSAC labels, and PX-CSI backend parameters.
    - Does not create VolumeSnapshotClasses (snapshot restore is unsupported with Realm-scoped credentials in PX-CSI 26.2.0).
 
-8. The operator discovers the new StorageClasses by label and populates `Tenant.status.storageClasses`.
+10. The operator discovers the new StorageClasses by label and populates `Tenant.status.storageClasses`.
 
 #### Cloud Provider Admin: Tenant Offboarding
 
@@ -326,7 +329,7 @@ The `setup` action reads the credential Secret for the selected Realm:
   no_log: true
 ```
 
-The admin is responsible for Realm-to-tenant assignment and ensuring each Realm is used by only one tenant. Dynamic pool management with automated checkout/release, exhaustion detection, and multi-backend support is deferred to a future generic storage pool management enhancement.
+The admin configures Realm-to-tenant assignment. The `setup` action validates 1:1 Realm-to-tenant mapping at runtime via the double-assignment guard (step 4 above), preventing a misconfigured pool from silently breaking tenant isolation. Dynamic pool management with automated checkout/release, exhaustion detection, and multi-backend support is deferred to a future generic storage pool management enhancement.
 
 #### Hub Secret Format for Pure
 
@@ -410,7 +413,11 @@ reclaimPolicy: Delete
 volumeBindingMode: Immediate
 ```
 
-The `pure_realm` parameter is the Realm selector — PX-CSI uses it to match the provisioning request to the correct `FlashBlades` entry in `pure.json` by Realm name. The `pure_nfs_server` and `pure_nfs_policy` parameters reference the NFS server and export policy created during `setup` within the Realm. **Verification required:** The PX-CSI 26.2.0 StorageClass reference documents `Realm` in `pure.json` `FlashBlades` entries but does not explicitly document `pure_realm` as a StorageClass parameter. The OSAC CSI proxy must translate `pure_realm` to the PX-CSI backend identity mechanism, or the parameter must be replaced with the documented routing mechanism. This must be validated with a two-Realm test to confirm requests route to the correct credential set (see OQ-1 and OQ-3). The naming convention (`pure-nfs-<tenant>-<tier>`) and label set are consistent with the VAST role's pattern (`vast-nfs-<tenant>-<tier>`).
+The `pure_realm` parameter is the Realm selector — PX-CSI uses it to match the provisioning request to the correct `FlashBlades` entry in `pure.json` by Realm name. The `pure_nfs_server` and `pure_nfs_policy` parameters reference the NFS server and export policy created during `setup` within the Realm.
+
+**Pre-implementation spike required (blocks Story 1.03).** The PX-CSI 26.2.0 StorageClass reference documents `Realm` in `pure.json` `FlashBlades` entries but does not explicitly document `pure_realm` as a StorageClass parameter. The design's entire multi-tenant routing model depends on this parameter telling PX-CSI which `FlashBlades` entry to use. A one-day spike with the actual PX-CSI driver image (`portworx/px-pure-csi-driver:26.2.0`) and two FlashBlade Realms must confirm: (a) that `pure_realm` in StorageClass parameters routes to the correct `FlashBlades` entry, and (b) that two StorageClasses with the same endpoint but different Realms do not cross-route. If `pure_realm` is not supported, the routing mechanism must be redesigned — the fallback is per-tenant Pure controller deployments (OQ-3 option (a)), which changes the `ensure_storage_class` action and hub resource model. This spike is tracked as a gating prerequisite for Story 1.03 (see OQ-1 and OQ-3).
+
+The naming convention (`pure-nfs-<tenant>-<tier>`) and label set are consistent with the VAST role's pattern (`vast-nfs-<tenant>-<tier>`).
 
 #### VolumeSnapshotClass Creation
 
@@ -644,6 +651,7 @@ Pure Storage has confirmed that FlashBlade supports up to 200 Realms per array. 
   - `ensure_storage_class` partial failure: Verify that if StorageClass creation fails after the credential Secret upsert succeeds, a retry does not create a duplicate `FlashBlades` entry.
   - `teardown_cluster_storage`: PVC/PV existence check (fail if active volumes remain), StorageClass removal.
   - `teardown_backend`: hub Secret deletion, tenant entry removal from shared credential Secret (delete Secret only when `FlashBlades` array is empty), NFS server and export policy cleanup.
+  - Realm double-assignment guard: assigning the same Realm to a second tenant fails with a descriptive error when a hub Secret with `osac.openshift.io/pure-realm: <realm>` already exists for a different tenant.
   - Missing Realm configuration: empty PURE_REALM_POOL produces descriptive error message.
   - Token redaction: verify all tasks handling `api_token`, credential Secrets, or `pure.json` content use `no_log: true` — validate that token values do not appear in captured task output.
 
@@ -722,4 +730,4 @@ Final: revise @ design 0.9.0 - 5629175, workspace OSAC-2117 @ 1baec0f
 
 > Context changed between draft and revise.
 
-<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.9.0","ai_workflows":"5629175","source_repo":"1baec0f","source_repo_branch":"OSAC-2117","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.9.0","ai_workflows":"5629175","source_repo":"1baec0f","source_repo_branch":"OSAC-2117","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
