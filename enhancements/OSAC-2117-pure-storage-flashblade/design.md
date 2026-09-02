@@ -3,7 +3,7 @@ title: pure-flashblade-storage-provider
 authors:
   - Danni Shi
 creation-date: 2026-07-27
-last-updated: 2026-08-26
+last-updated: 2026-09-02
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-2117
 prd:
@@ -29,13 +29,13 @@ This enhancement adds Pure Storage FlashBlade as an NFS file storage provider in
 
 OSAC currently supports only VAST as a file storage backend. Datacenters running Pure Storage FlashBlade hardware cannot provision tenant-isolated NFS storage through OSAC, forcing manual configuration outside the platform. FlashBlade is a widely deployed enterprise file and object storage platform with built-in multi-tenancy through Secure Multi-Tenancy (SMT) Realms, making it a natural fit for OSAC's per-tenant isolation model.
 
-The existing storage provider dispatch system (`osac.service.storage_provider`) is already dynamic: adding a `provider: "pure"` entry to `STORAGE_TIERS` automatically dispatches to `osac.templates.pure_storage`. This design leverages that extensibility, requiring a new template role, a fulfillment-service API for Realm pool management, and verification of the osac-csi-driver's Pure backend compatibility. The osac-operator's StorageReconciler discovers StorageClasses by OSAC labels, not by provider type, so Pure-backed StorageClasses integrate into the existing tenant storage resolution without StorageReconciler changes. However, the Volume controller's vendor provisioning path (OSAC-2872/OSAC-4138) currently routes all volumes through a single `VastVendorProvisioner` that hardcodes VAST-specific Secret names and CSI parameters. OSAC-4221 introduces provider-keyed routing with a Pure stub; this design fills that stub with a `PureVendorProvisioner` that handles NFS/file-specific provisioning parameters.
+The existing storage provider dispatch system (`osac.service.storage_provider`) is already dynamic: adding a `provider: "pure"` entry to `STORAGE_TIERS` automatically dispatches to `osac.templates.pure_storage`. This design leverages that extensibility, requiring a new template role and verification of the osac-csi-driver's Pure backend compatibility. Database-backed Realm pool management via the fulfillment-service API is deferred to a future enhancement. The osac-operator's StorageReconciler discovers StorageClasses by OSAC labels, not by provider type, so Pure-backed StorageClasses integrate into the existing tenant storage resolution without StorageReconciler changes. However, the Volume controller's vendor provisioning path (OSAC-2872/OSAC-4138) currently routes all volumes through a single `VastVendorProvisioner` that hardcodes VAST-specific Secret names and CSI parameters. OSAC-4221 introduces provider-keyed routing with a Pure stub; this design fills that stub with a `PureVendorProvisioner` that handles NFS/file-specific provisioning parameters.
 
 The key design challenge is Realm-to-tenant assignment. Unlike VAST, where OSAC creates tenants on-demand via the VAST VMS API, FlashBlade Realms must be pre-created by array administrators and assigned to OSAC tenants during onboarding. For the initial implementation, Realm assignment is handled through static configuration: the Cloud Infrastructure Admin pre-creates Realm credential Secrets on the hub cluster and configures a Realm pool list in the Instance Group ConfigMap. The `setup` action reads the configured Realm assignment and provisions within it. Dynamic pool management with checkout/release semantics, exhaustion handling, and multi-backend pool status tracking is deferred to a future generic storage pool management enhancement applicable to all storage providers.
 
 ### Goals
 
-- Reuse the existing storage provider dispatch and four-action interface (`setup`, `ensure_storage_class`, `teardown_cluster_storage`, `teardown_backend`) without modifying the dispatcher, playbooks, or operator.
+- Reuse the existing storage provider dispatch and four-action interface (`setup`, `ensure_storage_class`, `teardown_cluster_storage`, `teardown_backend`) without modifying the dispatcher or playbooks. Add a `PureVendorProvisioner` to the osac-operator's Volume controller (depends on OSAC-4221's provider-keyed routing); no changes to the StorageReconciler or other existing controllers.
 - Produce StorageClasses with identical OSAC label semantics to VAST (`osac.openshift.io/tenant`, `osac.openshift.io/storage-tier`, `osac.openshift.io/storage-protocol`, `app.kubernetes.io/managed-by: osac-aap`) so the operator, UI, and compute instance controllers discover them without modification.
 - Integrate with osac-csi-driver for CSI provisioning — vendor CSI controller on hub, OSAC CSI driver on tenant clusters — with no vendor-specific components installed directly on tenant clusters.
 - Use Realm-scoped API tokens exclusively for storage operations within a Realm, limiting blast radius to a single tenant's Realm.
@@ -65,7 +65,7 @@ The dispatcher routes to the AAP role automatically when `STORAGE_TIERS` contain
 
 #### Cloud Infrastructure Admin: Backend Registration
 
-Starting state: A Pure Storage FlashBlade array is deployed with Purity//FB 4.6.1+ and network connectivity from workload clusters to the management API and NFS data network. The osac-csi-driver is deployed with the Pure backend enabled.
+Starting state: A Pure Storage FlashBlade array is deployed with Purity//FB 4.6.1+. Network connectivity requirements: AAP and the hub cluster must reach the FlashBlade management API (for provisioning and CSI controller operations); workload cluster worker nodes must reach the FlashBlade NFS data VIP (for NFS mounts). Workload clusters do not require management API access. The osac-csi-driver is deployed with the Pure backend enabled.
 
 1. The Cloud Infrastructure Admin creates FlashBlade Realms on the array using the Pure Storage management console or API. Each Realm is configured with capacity quotas and QoS rate limits appropriate for a single tenant.
 
@@ -142,15 +142,15 @@ The diagram shows the `setup` action flow. The role reads the admin-configured R
 
 2. If no hub Secret exists, the action reads `PURE_REALM_POOL` from the Instance Group ConfigMap (JSON array of `{"realm_name": "...", "secret_name": "..."}` objects).
 
-3. It selects the first available Realm entry from the pool. If the pool is empty or not configured, the task fails with: `"No Realm configured in PURE_REALM_POOL. Configure Realm pool entries in the Instance Group ConfigMap."`
+3. It queries all existing hub Secrets in the `osac-system` namespace with label `osac.openshift.io/pure-realm-pool: "true"` pattern — specifically, Secrets with `osac.openshift.io/pure-realm` labels — to determine which Realms are already assigned to tenants. It selects the first pool entry whose `realm_name` does not match any existing hub Secret's `osac.openshift.io/pure-realm` label (i.e., the first unclaimed Realm). If all pool entries are claimed, the task fails with: `"All Realms in PURE_REALM_POOL are assigned. Add additional Realm entries or release existing assignments."` If the pool is empty or not configured, the task fails with: `"No Realm configured in PURE_REALM_POOL. Configure Realm pool entries in the Instance Group ConfigMap."`
 
-4. **Realm double-assignment guard.** Before proceeding, the action queries for any existing hub Secrets in the `osac-system` namespace with the label `osac.openshift.io/pure-realm: <selected-realm-name>` that belong to a *different* tenant. If a matching Secret is found, the action fails with: `"Realm '<realm-name>' is already assigned to tenant '<other-tenant>'. Each Realm must be assigned to exactly one tenant."` This prevents admin misconfiguration from silently breaking tenant isolation by assigning the same Realm to multiple tenants.
+4. **Realm double-assignment guard.** As a safety check, the action verifies the selected Realm has no existing hub Secret for a *different* tenant (belt-and-suspenders with the claim check in step 3). If a conflicting Secret is found, the action fails with: `"Realm '<realm-name>' is already assigned to tenant '<other-tenant>'. Each Realm must be assigned to exactly one tenant."` This prevents race conditions where concurrent onboarding jobs select the same Realm.
 
 5. It reads the corresponding K8s Secret to obtain the Realm-scoped API token, management endpoint, and NFS endpoint.
 
 6. It provisions FlashBlade resources within the Realm using the Realm-scoped API token from the credential Secret:
    - Creates an NFS server within the Realm (`purefb_server` module) with a tenant-scoped name (e.g., `osac-<tenant-name>`).
-   - Creates an NFS export policy (`purefb_policy` module) scoped to the NFS server, restricting client access to the tenant's workload cluster pod CIDRs.
+   - Creates an NFS export policy (`purefb_policy` module) scoped to the NFS server, restricting client access to the tenant's workload cluster worker-node CIDRs (NFS mounts originate from worker-node IPs, not pod CIDRs, because the CSI node plugin performs mounts in the host network namespace).
    - Creates NFS filesystems (`purefb_fs` module) within the Realm, attached to the NFS server.
    - The NFS server name and export policy name are persisted to the hub Secret for use by `ensure_storage_class` and `teardown_backend`.
 
@@ -194,7 +194,7 @@ Starting state: A Tenant CR is being deleted.
 
 2. The operator triggers `osac-delete-tenant-storage-backend`. The `teardown_backend` action:
    - Reads the hub Secret to identify the Realm.
-   - Removes NFS export policies and filesystems within the Realm using the Realm-scoped token.
+   - Removes NFS export policies, filesystems, and the NFS server within the Realm using the Realm-scoped token (in dependency order: policies first, then filesystems, then the server).
    - Removes the tenant's Realm entry from the shared Pure controller credential Secret (`pure-csi-credentials`) using optimistic-locking read-modify-write. If the resulting `FlashBlades` array is empty, deletes the Secret entirely.
    - Deletes the hub Secret.
 
@@ -301,7 +301,7 @@ pure_storage_validate_certs: "{{ lookup('env', 'PURE_VALIDATE_CERTS') | default(
 
 Realm assignment is managed through static configuration in the initial implementation. The Cloud Infrastructure Admin configures `PURE_REALM_POOL` in the Instance Group ConfigMap and creates per-Realm credential Secrets on the hub cluster.
 
-The `setup` action reads the pool configuration:
+The `setup` action reads the pool configuration. AAP Instance Group variables defined in the IG ConfigMap are injected as environment variables into the job execution environment by the AAP controller — `lookup('env', ...)` is the standard AAP mechanism for reading IG-level configuration:
 
 ```yaml
 - name: Read PURE_REALM_POOL from environment
@@ -316,7 +316,7 @@ The `setup` action reads the pool configuration:
   when: _pure_realm_pool | length == 0
 ```
 
-The `setup` action reads the credential Secret for the selected Realm:
+The `setup` action reads and validates the credential Secret for the selected Realm:
 
 ```yaml
 - name: Read Realm credential Secret
@@ -326,6 +326,20 @@ The `setup` action reads the credential Secret for the selected Realm:
     name: "{{ _selected_realm.secret_name }}"
     namespace: "{{ pure_storage_config_namespace }}"
   register: _pure_realm_secret
+  no_log: true
+
+- name: Validate Realm credential Secret
+  ansible.builtin.assert:
+    that:
+      - _pure_realm_secret.resources | length == 1
+      - _pure_realm_secret.resources[0].data.realm_name is defined
+      - _pure_realm_secret.resources[0].data.api_token is defined
+      - _pure_realm_secret.resources[0].data.mgmt_endpoint is defined
+      - _pure_realm_secret.resources[0].data.nfs_endpoint is defined
+      - (_pure_realm_secret.resources[0].data.realm_name | b64decode) == _selected_realm.realm_name
+    fail_msg: >-
+      Realm credential Secret '{{ _selected_realm.secret_name }}' is missing,
+      malformed, or realm_name does not match pool entry '{{ _selected_realm.realm_name }}'.
   no_log: true
 ```
 
@@ -549,7 +563,7 @@ Existing monitoring mechanisms apply:
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Realm-scoped tokens may not work with all `purestorage.flashblade` modules | Backend provisioning within a Realm fails; must fall back to array-admin tokens, increasing blast radius | Validate during implementation with a test FlashBlade. If confirmed, use array-admin tokens for provisioning but scope CSI driver tokens per-Realm |
+| Realm-scoped tokens may not work with all `purestorage.flashblade` modules | Backend provisioning within a Realm fails | Validate during implementation with a test FlashBlade. If Realm-scoped tokens are unsupported, `setup` fails closed and surfaces the incompatibility — OSAC does not fall back to array-admin tokens, as this would violate the Realm-only security boundary and expand blast radius beyond a single tenant's Realm |
 | osac-csi-driver Pure controller may not support FlashBlade NFS (only FlashArray block) | Cannot use osac-csi-driver for Pure NFS; would need to extend the Pure controller chart or add a FlashBlade-specific controller | Verify during implementation. The `pure.json` format supports `FlashBlades` entries, suggesting the driver supports FlashBlade. Chart may need FlashBlade-specific configuration |
 | osac-csi-driver Pure controller supports only one Realm per deployment | Multi-tenant support requires one Pure controller per tenant on the hub, increasing hub resource usage | Investigate during implementation. May require chart changes to support per-tenant Pure controller deployments or credential multiplexing |
 
@@ -726,8 +740,8 @@ The PX-CSI driver version on the hub cluster is managed by the osac-csi-driver c
 ## Provenance
 
 Authored: draft @ design 0.3.0 - 92734a2, workspace OSAC-2117 @ 1baec0f
-Final: revise @ design 0.9.0 - 5629175, workspace OSAC-2117 @ 1baec0f
+Final: respond @ design 0.9.0 - 5629175, workspace OSAC-2117 @ 1baec0f
 
-> Context changed between draft and revise.
+> Context changed between draft and respond.
 
-<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.9.0","ai_workflows":"5629175","source_repo":"1baec0f","source_repo_branch":"OSAC-2117","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.9.0","ai_workflows":"5629175","source_repo":"1baec0f","source_repo_branch":"OSAC-2117","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise","revise","revise","respond"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
